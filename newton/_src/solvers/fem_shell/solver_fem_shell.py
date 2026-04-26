@@ -333,9 +333,12 @@ def _compute_bending_forces_and_stiffness(
     sin_theta = wp.dot(wp.cross(n0_hat, n1_hat), e_hat)
     theta = wp.atan2(sin_theta, cos_theta)
 
-    # Bending energy: W = kappa * (theta - theta_0)^2 * L / 2
+    # Bending energy (Discrete Shells, Grinspun 2003):
+    # W = kappa_e * (theta - theta_0)^2, kappa_e = 3*D/|ē|
+    # where D = E*h³/(12*(1-ν²)) is the flexural rigidity
+    # Force: f = -dW/dx = -2*kappa_e*(theta-theta_0)*dtheta/dx
     delta_theta = theta - rest_angle
-    energy_scale = bending_stiffness * rest_len
+    kappa_e = 3.0 * bending_stiffness / rest_len
 
     # Heights from edge to opposite vertices (for gradient computation)
     h0 = n0_len / e_len  # distance from opp0 to edge
@@ -355,16 +358,16 @@ def _compute_bending_forces_and_stiffness(
     # Correction: grad2 + grad3 = -(grad0 + grad1) for force balance
     grad3 = -(grad0 + grad1 + grad2)
 
-    # Force = -dW/dx = -kappa * (theta - theta_0) * L * dtheta/dx
-    f_scale = -energy_scale * delta_theta
+    # Force = -dW/dx = -2 * kappa_e * delta_theta * dtheta/dx
+    f_scale = -2.0 * kappa_e * delta_theta
 
     wp.atomic_add(forces, i0, f_scale * grad0)
     wp.atomic_add(forces, i1, f_scale * grad1)
     wp.atomic_add(forces, i2, f_scale * grad2)
     wp.atomic_add(forces, i3, f_scale * grad3)
 
-    # Stiffness blocks: K[vi,vj] = kappa * L * grad_i ⊗ grad_j
-    # (rank-1 approximation — ignores curvature of theta w.r.t. x)
+    # Stiffness blocks: K[vi,vj] = 2 * kappa_e * grad_i ⊗ grad_j
+    # (rank-1 Hessian approximation of W = kappa_e * (delta_theta)^2)
     grads_val_0 = grad0
     grads_val_1 = grad1
     grads_val_2 = grad2
@@ -403,12 +406,23 @@ def _compute_bending_forces_and_stiffness(
                 gj = grads_val_3
                 cj = vertex_ids_3
 
-            K_block = energy_scale * wp.outer(gi, gj)
+            K_block = 2.0 * kappa_e * wp.outer(gi, gj)
 
             out_idx = eid * 16 + vi * 4 + vj
             bend_triplet_rows[out_idx] = ri
             bend_triplet_cols[out_idx] = cj
             bend_triplet_vals[out_idx] = K_block
+
+
+@wp.kernel
+def _add_external_forces(
+    external_f: wp.array(dtype=wp.vec3),
+    elastic_f: wp.array(dtype=wp.vec3),
+    out_f: wp.array(dtype=wp.vec3),
+):
+    """Add external/contact forces to elastic forces."""
+    i = wp.tid()
+    out_f[i] = elastic_f[i] + external_f[i]
 
 
 @wp.kernel
@@ -529,11 +543,12 @@ class SolverFEMShell(SolverBase):
         self.substeps = substeps
         self.last_residual = float("inf")
 
-        # Lamé parameters from E, ν (plane stress for thin shells)
+        # Lamé parameters from E, ν — plane STRESS for thin shells
+        # (not plane strain which has 1-2ν denominator and diverges as ν→0.5)
         E = young_modulus
         nu = poisson_ratio
         self.mu = E / (2.0 * (1.0 + nu))
-        self.lmbda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+        self.lmbda = E * nu / ((1.0 + nu) * (1.0 - nu))
 
         # Scale by thickness for membrane energy
         self.membrane_mu = self.mu * thickness
@@ -590,6 +605,9 @@ class SolverFEMShell(SolverBase):
         wp.copy(state_out.particle_qd, state_in.particle_qd)
 
         for _sub in range(self.substeps):
+            # TODO Phase C: proper IPC contact. Newton's penalty contacts
+            # are too stiff for implicit Euler — skip for now.
+
             # 1. Compute elastic forces + stiffness at current position
             self._elastic_forces.zero_()
             self._triplet_vals.zero_()
@@ -631,6 +649,11 @@ class SolverFEMShell(SolverBase):
                     ],
                     device=device,
                 )
+
+            # 1c. Add external/contact forces (from Newton's collision, if available)
+            # TODO Phase C: proper IPC contact
+            # For now, only add if state has been collided
+            # (skipped — Newton penalty contacts explode with implicit Euler)
 
             # 2. Assemble A = M + dt²(K_membrane + K_bending)
             # Pre-allocate combined triplet arrays (avoid numpy concat in hot loop)
