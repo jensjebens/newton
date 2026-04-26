@@ -377,10 +377,11 @@ def _compute_bending_forces_and_stiffness(
     wp.atomic_add(forces, i2, f_scale * grad2)
     wp.atomic_add(forces, i3, f_scale * grad3)
 
-    # Stiffness blocks: scale by |delta_theta| so K=0 at rest
-    # Full Hessian: d²W/dx² = 2*kappa_e*(grad⊗grad + delta_theta*d²theta/dx²)
-    # We use: K ≈ 2*kappa_e*|delta_theta|*grad⊗grad (smoothly zero at rest)
-    stiffness_scale = 2.0 * kappa_e * wp.abs(delta_theta)
+    # Stiffness blocks: K[vi,vj] = 2 * kappa_e * grad_i ⊗ grad_j
+    # (rank-1 Hessian approximation of W = kappa_e * (delta_theta)^2)
+    # Non-zero at rest is correct: provides resistance to any perturbation
+    # from the rest angle.
+    stiffness_scale = 2.0 * kappa_e
     grads_val_0 = grad0
     grads_val_1 = grad1
     grads_val_2 = grad2
@@ -585,7 +586,7 @@ class SolverFEMShell(SolverBase):
         cg_tol: float = 1e-6,
         cg_max_iter: int = 200,
         damping: float = 0.005,
-        substeps: int = 8,
+        substeps: int = 16,
     ):
         super().__init__(model)
 
