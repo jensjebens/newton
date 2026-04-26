@@ -346,8 +346,9 @@ def _compute_bending_forces_and_stiffness(
 
     # Bending force gradients (dtheta/dx for each vertex)
     # See Grinspun et al. "Discrete Shells" for derivation
-    grad0 = n0_hat / h0  # dtheta/dx0
-    grad1 = -n1_hat / h1  # dtheta/dx1
+    # Signs verified numerically: moving opp0 in n0 direction DECREASES theta
+    grad0 = -n0_hat / h0  # dtheta/dx0 (opposite vertex of face 0)
+    grad1 = -n1_hat / h1  # dtheta/dx1 (opposite vertex of face 1)
 
     # For shared vertices, use chain rule with edge parametric coords
     t02 = wp.dot(p0 - p2, e_hat) / e_len  # parametric coord of p0 projected onto edge
@@ -423,6 +424,43 @@ def _add_external_forces(
     """Add external/contact forces to elastic forces."""
     i = wp.tid()
     out_f[i] = elastic_f[i] + external_f[i]
+
+
+@wp.kernel
+def _compute_simple_contacts(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_inv_mass: wp.array(dtype=float),
+    ground_z: float,
+    sphere_center: wp.vec3,
+    sphere_radius: float,
+    contact_stiffness: float,
+    contact_damping: float,
+    particle_qd: wp.array(dtype=wp.vec3),
+    forces: wp.array(dtype=wp.vec3),
+):
+    """Simple ground + sphere penalty contact (implicit-friendly stiffness)."""
+    i = wp.tid()
+    if particle_inv_mass[i] <= 0.0:
+        return
+    p = particle_q[i]
+    v = particle_qd[i]
+    margin = 0.02
+    # Ground
+    depth = ground_z + margin - p[2]
+    if depth > 0.0:
+        f_z = contact_stiffness * depth - contact_damping * v[2]
+        if f_z > 0.0:
+            wp.atomic_add(forces, i, wp.vec3(0.0, 0.0, f_z))
+    # Sphere
+    to_s = p - sphere_center
+    dist = wp.length(to_s)
+    pen = (sphere_radius + margin) - dist
+    if pen > 0.0 and dist > 1.0e-8:
+        n = to_s / dist
+        vn = wp.dot(v, n)
+        fc = contact_stiffness * pen - contact_damping * vn
+        if fc > 0.0:
+            wp.atomic_add(forces, i, n * fc)
 
 
 @wp.kernel
@@ -650,10 +688,25 @@ class SolverFEMShell(SolverBase):
                     device=device,
                 )
 
-            # 1c. Add external/contact forces (from Newton's collision, if available)
-            # TODO Phase C: proper IPC contact
-            # For now, only add if state has been collided
-            # (skipped — Newton penalty contacts explode with implicit Euler)
+            # 1c. Simple contact forces (ground + sphere)
+            # TODO Phase C: replace with proper IPC barriers
+            if hasattr(self, '_contact_sphere_center'):
+                wp.launch(
+                    _compute_simple_contacts,
+                    dim=n,
+                    inputs=[
+                        state_out.particle_q,
+                        model.particle_inv_mass,
+                        0.0,  # ground_z
+                        self._contact_sphere_center,
+                        self._contact_sphere_radius,
+                        self._contact_stiffness,
+                        self._contact_damping,
+                        state_out.particle_qd,
+                    ],
+                    outputs=[self._elastic_forces],
+                    device=device,
+                )
 
             # 2. Assemble A = M + dt²(K_membrane + K_bending)
             # Pre-allocate combined triplet arrays (avoid numpy concat in hot loop)
@@ -741,3 +794,17 @@ class SolverFEMShell(SolverBase):
             wp.copy(state_out.particle_q, self._q_temp)
 
         self.integrate_bodies(model, state_in, state_out, dt)
+
+    def set_contact_sphere(self, center, radius, stiffness=1e4, damping=10.0):
+        """Configure a simple sphere + ground contact for testing.
+
+        Args:
+            center: Sphere center as (x, y, z) tuple.
+            radius: Sphere radius.
+            stiffness: Contact penalty stiffness (keep low for implicit stability).
+            damping: Contact damping coefficient.
+        """
+        self._contact_sphere_center = wp.vec3(float(center[0]), float(center[1]), float(center[2]))
+        self._contact_sphere_radius = float(radius)
+        self._contact_stiffness = float(stiffness)
+        self._contact_damping = float(damping)
