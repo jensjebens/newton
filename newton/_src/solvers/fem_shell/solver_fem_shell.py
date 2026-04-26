@@ -340,6 +340,16 @@ def _compute_bending_forces_and_stiffness(
     delta_theta = theta - rest_angle
     kappa_e = 3.0 * bending_stiffness / rest_len
 
+    # Skip if bending stiffness is negligible
+    if kappa_e < 1.0e-6:
+        for vi in range(4):
+            for vj in range(4):
+                out_idx = eid * 16 + vi * 4 + vj
+                bend_triplet_rows[out_idx] = 0
+                bend_triplet_cols[out_idx] = 0
+                bend_triplet_vals[out_idx] = wp.mat33(0.0)
+        return
+
     # Heights from edge to opposite vertices (for gradient computation)
     h0 = n0_len / e_len  # distance from opp0 to edge
     h1 = n1_len / e_len  # distance from opp1 to edge
@@ -367,8 +377,10 @@ def _compute_bending_forces_and_stiffness(
     wp.atomic_add(forces, i2, f_scale * grad2)
     wp.atomic_add(forces, i3, f_scale * grad3)
 
-    # Stiffness blocks: K[vi,vj] = 2 * kappa_e * grad_i ⊗ grad_j
-    # (rank-1 Hessian approximation of W = kappa_e * (delta_theta)^2)
+    # Stiffness blocks: scale by |delta_theta| so K=0 at rest
+    # Full Hessian: d²W/dx² = 2*kappa_e*(grad⊗grad + delta_theta*d²theta/dx²)
+    # We use: K ≈ 2*kappa_e*|delta_theta|*grad⊗grad (smoothly zero at rest)
+    stiffness_scale = 2.0 * kappa_e * wp.abs(delta_theta)
     grads_val_0 = grad0
     grads_val_1 = grad1
     grads_val_2 = grad2
@@ -407,7 +419,7 @@ def _compute_bending_forces_and_stiffness(
                 gj = grads_val_3
                 cj = vertex_ids_3
 
-            K_block = 2.0 * kappa_e * wp.outer(gi, gj)
+            K_block = stiffness_scale * wp.outer(gi, gj)
 
             out_idx = eid * 16 + vi * 4 + vj
             bend_triplet_rows[out_idx] = ri
@@ -573,7 +585,7 @@ class SolverFEMShell(SolverBase):
         cg_tol: float = 1e-6,
         cg_max_iter: int = 200,
         damping: float = 0.005,
-        substeps: int = 16,
+        substeps: int = 8,
     ):
         super().__init__(model)
 
