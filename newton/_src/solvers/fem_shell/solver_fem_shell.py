@@ -451,28 +451,88 @@ def _compute_simple_contacts(
     particle_qd: wp.array(dtype=wp.vec3),
     forces: wp.array(dtype=wp.vec3),
 ):
-    """Simple ground + sphere penalty contact (implicit-friendly stiffness)."""
+    """Ground + sphere penalty contact with cubic stiffness."""
     i = wp.tid()
     if particle_inv_mass[i] <= 0.0:
         return
     p = particle_q[i]
     v = particle_qd[i]
-    margin = 0.02
-    # Ground
+    margin = 0.005
+    # Ground — cubic penalty
     depth = ground_z + margin - p[2]
     if depth > 0.0:
-        # Quadratic penalty + strong damping
-        f_z = contact_stiffness * depth * depth + contact_damping * wp.max(-v[2], 0.0)
+        f_z = contact_stiffness * depth * depth * depth + contact_damping * wp.max(-v[2], 0.0)
         wp.atomic_add(forces, i, wp.vec3(0.0, 0.0, f_z))
-    # Sphere
+    # Sphere — cubic penalty
     to_s = p - sphere_center
     dist = wp.length(to_s)
     pen = (sphere_radius + margin) - dist
     if pen > 0.0 and dist > 1.0e-8:
         n = to_s / dist
         vn = wp.dot(v, n)
-        fc = contact_stiffness * pen * pen + contact_damping * wp.max(-vn, 0.0)
+        fc = contact_stiffness * pen * pen * pen + contact_damping * wp.max(-vn, 0.0)
         wp.atomic_add(forces, i, n * fc)
+
+
+@wp.kernel
+def _update_plastic_rest_angles(
+    particle_q: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array2d(dtype=wp.int32),
+    edge_rest_angle: wp.array(dtype=float),
+    yield_angle: float,
+    plasticity_rate: float,
+):
+    """Update rest angles for plastic deformation.
+
+    When the current dihedral angle deviates from rest by more than
+    yield_angle, the rest angle creeps toward the current angle.
+    This creates permanent creases.
+    """
+    eid = wp.tid()
+    i0 = edge_indices[eid, 0]
+    i1 = edge_indices[eid, 1]
+    i2 = edge_indices[eid, 2]
+    i3 = edge_indices[eid, 3]
+
+    if i0 == -1 or i1 == -1:
+        return
+
+    p0 = particle_q[i0]
+    p1 = particle_q[i1]
+    p2 = particle_q[i2]
+    p3 = particle_q[i3]
+
+    # Compute current dihedral angle
+    e = p3 - p2
+    e_len = wp.length(e)
+    if e_len < 1.0e-10:
+        return
+    e_hat = e / e_len
+
+    n0 = wp.cross(e, p0 - p2)
+    n1 = wp.cross(p1 - p2, e)
+    n0_len = wp.length(n0)
+    n1_len = wp.length(n1)
+    if n0_len < 1.0e-10 or n1_len < 1.0e-10:
+        return
+
+    n0_hat = n0 / n0_len
+    n1_hat = n1 / n1_len
+    cos_theta = wp.clamp(wp.dot(n0_hat, n1_hat), -1.0, 1.0)
+    sin_theta = wp.dot(wp.cross(n0_hat, n1_hat), e_hat)
+    theta = wp.atan2(sin_theta, cos_theta)
+
+    rest = edge_rest_angle[eid]
+    delta = theta - rest
+
+    # If deformation exceeds yield, update rest angle
+    if wp.abs(delta) > yield_angle:
+        # Creep rest angle toward current (permanent deformation)
+        sign = 1.0
+        if delta < 0.0:
+            sign = -1.0
+        excess = wp.abs(delta) - yield_angle
+        edge_rest_angle[eid] = rest + sign * excess * plasticity_rate
 
 
 @wp.kernel
@@ -586,7 +646,9 @@ class SolverFEMShell(SolverBase):
         cg_tol: float = 1e-6,
         cg_max_iter: int = 200,
         damping: float = 0.005,
-        substeps: int = 16,
+        substeps: int = 8,
+        yield_angle: float = 0.0,
+        plasticity_rate: float = 0.5,
     ):
         super().__init__(model)
 
@@ -597,6 +659,8 @@ class SolverFEMShell(SolverBase):
         self.cg_max_iter = cg_max_iter
         self.damping = damping
         self.substeps = substeps
+        self.yield_angle = yield_angle
+        self.plasticity_rate = plasticity_rate
         self.last_residual = float("inf")
 
         # Lamé parameters from E, ν — plane STRESS for thin shells
@@ -810,6 +874,21 @@ class SolverFEMShell(SolverBase):
                 device=device,
             )
             wp.copy(state_out.particle_q, self._q_temp)
+
+            # Plastic deformation: update rest angles if yield exceeded
+            if self.yield_angle > 0.0 and model.edge_count > 0:
+                wp.launch(
+                    _update_plastic_rest_angles,
+                    dim=model.edge_count,
+                    inputs=[
+                        state_out.particle_q,
+                        model.edge_indices,
+                        model.edge_rest_angle,
+                        self.yield_angle,
+                        self.plasticity_rate,
+                    ],
+                    device=device,
+                )
 
         self.integrate_bodies(model, state_in, state_out, dt)
 
