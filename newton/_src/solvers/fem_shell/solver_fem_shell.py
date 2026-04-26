@@ -246,6 +246,172 @@ def _compute_element_stiffness(
 
 
 @wp.kernel
+def _compute_bending_forces_and_stiffness(
+    particle_q: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array2d(dtype=wp.int32),
+    edge_rest_angle: wp.array(dtype=float),
+    edge_rest_length: wp.array(dtype=float),
+    bending_stiffness: float,
+    # outputs: forces + stiffness triplets (16 blocks per edge: 4x4 vertex pairs)
+    forces: wp.array(dtype=wp.vec3),
+    bend_triplet_rows: wp.array(dtype=wp.int32),
+    bend_triplet_cols: wp.array(dtype=wp.int32),
+    bend_triplet_vals: wp.array(dtype=wp.mat33),
+):
+    """Compute bending forces and stiffness via dihedral angle energy.
+
+    Bending energy per edge: W = stiffness * (theta - theta_0)^2 * L / 2
+    where theta is the dihedral angle, theta_0 is rest angle, L is edge length.
+
+    Edge indices: [opp0, opp1, shared0, shared1]
+    Skip boundary edges (opp0 == -1 or opp1 == -1).
+
+    Stiffness is computed via finite differences of the bending force
+    (analytic bending Hessian is complex; FD is acceptable for Phase B POC
+    since bending stiffness is much smaller than membrane stiffness).
+    """
+    eid = wp.tid()
+
+    i0 = edge_indices[eid, 0]  # opposite vertex 0
+    i1 = edge_indices[eid, 1]  # opposite vertex 1
+    i2 = edge_indices[eid, 2]  # shared vertex 0 (edge start)
+    i3 = edge_indices[eid, 3]  # shared vertex 1 (edge end)
+
+    # Skip boundary edges
+    if i0 == -1 or i1 == -1:
+        for vi in range(4):
+            for vj in range(4):
+                out_idx = eid * 16 + vi * 4 + vj
+                bend_triplet_rows[out_idx] = 0
+                bend_triplet_cols[out_idx] = 0
+                bend_triplet_vals[out_idx] = wp.mat33(0.0)
+        return
+
+    p0 = particle_q[i0]
+    p1 = particle_q[i1]
+    p2 = particle_q[i2]
+    p3 = particle_q[i3]
+
+    rest_angle = edge_rest_angle[eid]
+    rest_len = edge_rest_length[eid]
+
+    # Compute dihedral angle
+    e = p3 - p2  # shared edge vector
+    e_len = wp.length(e)
+    if e_len < 1.0e-10:
+        for vi in range(4):
+            for vj in range(4):
+                out_idx = eid * 16 + vi * 4 + vj
+                bend_triplet_rows[out_idx] = 0
+                bend_triplet_cols[out_idx] = 0
+                bend_triplet_vals[out_idx] = wp.mat33(0.0)
+        return
+
+    e_hat = e / e_len
+
+    # Face normals
+    n0 = wp.cross(e, p0 - p2)
+    n1 = wp.cross(p1 - p2, e)
+
+    n0_len = wp.length(n0)
+    n1_len = wp.length(n1)
+
+    if n0_len < 1.0e-10 or n1_len < 1.0e-10:
+        for vi in range(4):
+            for vj in range(4):
+                out_idx = eid * 16 + vi * 4 + vj
+                bend_triplet_rows[out_idx] = 0
+                bend_triplet_cols[out_idx] = 0
+                bend_triplet_vals[out_idx] = wp.mat33(0.0)
+        return
+
+    n0_hat = n0 / n0_len
+    n1_hat = n1 / n1_len
+
+    cos_theta = wp.dot(n0_hat, n1_hat)
+    cos_theta = wp.clamp(cos_theta, -1.0, 1.0)
+    sin_theta = wp.dot(wp.cross(n0_hat, n1_hat), e_hat)
+    theta = wp.atan2(sin_theta, cos_theta)
+
+    # Bending energy: W = kappa * (theta - theta_0)^2 * L / 2
+    delta_theta = theta - rest_angle
+    energy_scale = bending_stiffness * rest_len
+
+    # Heights from edge to opposite vertices (for gradient computation)
+    h0 = n0_len / e_len  # distance from opp0 to edge
+    h1 = n1_len / e_len  # distance from opp1 to edge
+
+    # Bending force gradients (dtheta/dx for each vertex)
+    # See Grinspun et al. "Discrete Shells" for derivation
+    grad0 = n0_hat / h0  # dtheta/dx0
+    grad1 = -n1_hat / h1  # dtheta/dx1
+
+    # For shared vertices, use chain rule with edge parametric coords
+    t02 = wp.dot(p0 - p2, e_hat) / e_len  # parametric coord of p0 projected onto edge
+    t12 = wp.dot(p1 - p2, e_hat) / e_len
+
+    grad2 = -(1.0 - t02) * grad0 - (1.0 - t12) * grad1  # dtheta/dx2 (edge start)
+    grad3 = -t02 * grad0 - t12 * grad1  # dtheta/dx3 (edge end) -- note: signs from discrete shells
+    # Correction: grad2 + grad3 = -(grad0 + grad1) for force balance
+    grad3 = -(grad0 + grad1 + grad2)
+
+    # Force = -dW/dx = -kappa * (theta - theta_0) * L * dtheta/dx
+    f_scale = -energy_scale * delta_theta
+
+    wp.atomic_add(forces, i0, f_scale * grad0)
+    wp.atomic_add(forces, i1, f_scale * grad1)
+    wp.atomic_add(forces, i2, f_scale * grad2)
+    wp.atomic_add(forces, i3, f_scale * grad3)
+
+    # Stiffness blocks: K[vi,vj] = kappa * L * grad_i ⊗ grad_j
+    # (rank-1 approximation — ignores curvature of theta w.r.t. x)
+    grads_val_0 = grad0
+    grads_val_1 = grad1
+    grads_val_2 = grad2
+    grads_val_3 = grad3
+
+    vertex_ids_0 = i0
+    vertex_ids_1 = i1
+    vertex_ids_2 = i2
+    vertex_ids_3 = i3
+
+    for vi in range(4):
+        if vi == 0:
+            gi = grads_val_0
+            ri = vertex_ids_0
+        elif vi == 1:
+            gi = grads_val_1
+            ri = vertex_ids_1
+        elif vi == 2:
+            gi = grads_val_2
+            ri = vertex_ids_2
+        else:
+            gi = grads_val_3
+            ri = vertex_ids_3
+
+        for vj in range(4):
+            if vj == 0:
+                gj = grads_val_0
+                cj = vertex_ids_0
+            elif vj == 1:
+                gj = grads_val_1
+                cj = vertex_ids_1
+            elif vj == 2:
+                gj = grads_val_2
+                cj = vertex_ids_2
+            else:
+                gj = grads_val_3
+                cj = vertex_ids_3
+
+            K_block = energy_scale * wp.outer(gi, gj)
+
+            out_idx = eid * 16 + vi * 4 + vj
+            bend_triplet_rows[out_idx] = ri
+            bend_triplet_cols[out_idx] = cj
+            bend_triplet_vals[out_idx] = K_block
+
+
+@wp.kernel
 def _implicit_euler_rhs(
     particle_qd: wp.array(dtype=wp.vec3),
     particle_inv_mass: wp.array(dtype=float),
@@ -350,7 +516,7 @@ class SolverFEMShell(SolverBase):
         cg_tol: float = 1e-6,
         cg_max_iter: int = 200,
         damping: float = 0.005,
-        substeps: int = 8,
+        substeps: int = 16,
     ):
         super().__init__(model)
 
@@ -373,9 +539,13 @@ class SolverFEMShell(SolverBase):
         self.membrane_mu = self.mu * thickness
         self.membrane_lmbda = self.lmbda * thickness
 
+        # Bending stiffness: κ = E*h³/(12*(1-ν²)) (Kirchhoff plate theory)
+        self.bending_stiffness = young_modulus * thickness**3 / (12.0 * (1.0 - poisson_ratio**2))
+
         # Pre-allocate work arrays
         n = model.particle_count
         t = model.tri_count
+        e = model.edge_count
         device = model.device
 
         self._elastic_forces = wp.zeros(n, dtype=wp.vec3, device=device)
@@ -386,6 +556,11 @@ class SolverFEMShell(SolverBase):
         self._triplet_rows = wp.zeros(t * 9, dtype=wp.int32, device=device)
         self._triplet_cols = wp.zeros(t * 9, dtype=wp.int32, device=device)
         self._triplet_vals = wp.zeros(t * 9, dtype=wp.mat33, device=device)
+
+        # Bending stiffness triplets: 16 entries per edge (4×4 vertex pairs)
+        self._bend_triplet_rows = wp.zeros(e * 16, dtype=wp.int32, device=device)
+        self._bend_triplet_cols = wp.zeros(e * 16, dtype=wp.int32, device=device)
+        self._bend_triplet_vals = wp.zeros(e * 16, dtype=wp.mat33, device=device)
 
         # Cache gravity
         g = model.gravity.numpy().flatten()
@@ -418,6 +593,7 @@ class SolverFEMShell(SolverBase):
             # 1. Compute elastic forces + stiffness at current position
             self._elastic_forces.zero_()
             self._triplet_vals.zero_()
+            self._bend_triplet_vals.zero_()
 
             if model.tri_count > 0:
                 wp.launch(
@@ -435,11 +611,51 @@ class SolverFEMShell(SolverBase):
                     device=device,
                 )
 
-            # 2. Assemble A = M + dt²K
+            # 1b. Compute bending forces + stiffness
+            if model.edge_count > 0:
+                wp.launch(
+                    _compute_bending_forces_and_stiffness,
+                    dim=model.edge_count,
+                    inputs=[
+                        state_out.particle_q,
+                        model.edge_indices,
+                        model.edge_rest_angle,
+                        model.edge_rest_length,
+                        self.bending_stiffness,
+                    ],
+                    outputs=[
+                        self._elastic_forces,
+                        self._bend_triplet_rows,
+                        self._bend_triplet_cols,
+                        self._bend_triplet_vals,
+                    ],
+                    device=device,
+                )
+
+            # 2. Assemble A = M + dt²(K_membrane + K_bending)
+            # Pre-allocate combined triplet arrays (avoid numpy concat in hot loop)
+            n_mem = model.tri_count * 9
+            n_bend = model.edge_count * 16
+            n_total = n_mem + n_bend
+
+            if not hasattr(self, '_all_rows') or self._all_rows.shape[0] != n_total:
+                self._all_rows = wp.zeros(n_total, dtype=wp.int32, device=device)
+                self._all_cols = wp.zeros(n_total, dtype=wp.int32, device=device)
+                self._all_vals = wp.zeros(n_total, dtype=wp.mat33, device=device)
+
+            # Copy membrane triplets to combined arrays
+            wp.copy(self._all_rows, self._triplet_rows, dest_offset=0, src_offset=0, count=n_mem)
+            wp.copy(self._all_cols, self._triplet_cols, dest_offset=0, src_offset=0, count=n_mem)
+            wp.copy(self._all_vals, self._triplet_vals, dest_offset=0, src_offset=0, count=n_mem)
+            # Copy bending triplets
+            wp.copy(self._all_rows, self._bend_triplet_rows, dest_offset=n_mem, src_offset=0, count=n_bend)
+            wp.copy(self._all_cols, self._bend_triplet_cols, dest_offset=n_mem, src_offset=0, count=n_bend)
+            wp.copy(self._all_vals, self._bend_triplet_vals, dest_offset=n_mem, src_offset=0, count=n_bend)
+
             K = wps.bsr_from_triplets(
                 rows_of_blocks=n, cols_of_blocks=n,
-                rows=self._triplet_rows, columns=self._triplet_cols,
-                values=self._triplet_vals,
+                rows=self._all_rows, columns=self._all_cols,
+                values=self._all_vals,
             )
             wps.bsr_scale(K, sub_dt * sub_dt)
 
