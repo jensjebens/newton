@@ -137,6 +137,28 @@ def _compute_element_stiffness(
     # Deformation gradient columns
     e1 = p1 - p0
     e2 = p2 - p0
+
+    # Check for degenerate triangle (current area vs rest area)
+    current_area_2x = wp.length(wp.cross(e1, e2))
+    if current_area_2x < area * 0.01:  # triangle compressed to <1% of rest area
+        for vi in range(3):
+            for vj in range(3):
+                out_idx = tid * 9 + vi * 3 + vj
+                if vi == 0:
+                    triplet_rows[out_idx] = v0
+                elif vi == 1:
+                    triplet_rows[out_idx] = v1
+                else:
+                    triplet_rows[out_idx] = v2
+                if vj == 0:
+                    triplet_cols[out_idx] = v0
+                elif vj == 1:
+                    triplet_cols[out_idx] = v1
+                else:
+                    triplet_cols[out_idx] = v2
+                triplet_vals[out_idx] = wp.mat33(0.0)
+        return
+
     f0 = e1 * DmInv00 + e2 * DmInv10
     f1 = e1 * DmInv01 + e2 * DmInv11
 
@@ -627,7 +649,7 @@ def _update_velocity(
         new_v = (1.0 - damping) * (particle_qd_in[i] + dv[i])
         # Clamp velocity to prevent explosion
         speed = wp.length(new_v)
-        max_speed = 20.0  # m/s
+        max_speed = 5.0  # m/s — lower clamp prevents energy buildup
         if speed > max_speed:
             new_v = new_v * (max_speed / speed)
         particle_qd_out[i] = new_v
