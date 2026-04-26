@@ -329,6 +329,181 @@ class TestImplicitSolve(unittest.TestCase):
         self.assertLess(solver.last_residual, 1e-4, f"PCG didn't converge: residual={solver.last_residual}")
 
 
+# ---------------------------------------------------------------------------
+# Phase B Tests: Bending energy
+# ---------------------------------------------------------------------------
+class TestBendingEnergy(unittest.TestCase):
+    """Phase B: bending energy must resist out-of-plane deformation."""
+
+    def test_cantilever_bending_resistance(self):
+        """Cantilever under gravity: stiff material should sag < 10cm (not droop like cloth).
+
+        With bending energy, a stiff sheet (E=3GPa, h=2mm) should deflect
+        according to Euler-Bernoulli beam theory, not droop like a wet cloth.
+        Analytical max deflection: δ = qL⁴/(8EI) where I = h³/12.
+        For our params: δ ≈ 2.6cm.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=10,
+            dim_y=10,
+            cell_x=0.08,
+            cell_y=0.08,  # 0.8m × 0.8m
+            mass=0.05,
+            fix_left=True,  # cantilever
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=3.0e9,  # cardboard
+            poisson_ratio=0.3,
+            thickness=0.002,
+        )
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        pos0 = s0.particle_q.numpy()
+        initial_z_min = np.min(pos0[:, 2])
+
+        # Simulate 2 seconds (should settle)
+        dt = 1.0 / 60.0
+        for _ in range(120):
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+        sag = initial_z_min - np.min(pos[:, 2])
+
+        # Should sag less than 10cm (plate-like, not cloth-like)
+        # VBD sags 0.85m+ at same params — this should be much less
+        self.assertLess(sag, 0.10, f"Sag {sag:.3f}m too large for E=3GPa cardboard")
+        # But should sag SOME (not perfectly rigid)
+        self.assertGreater(sag, 0.001, f"Sag {sag:.4f}m too small — bending not working?")
+
+    def test_cantilever_stretch_with_bending(self):
+        """With bending energy, cantilever should also have minimal stretch."""
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=10,
+            dim_y=10,
+            cell_x=0.08,
+            cell_y=0.08,
+            mass=0.05,
+            fix_left=True,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=3.0e9,
+            poisson_ratio=0.3,
+            thickness=0.002,
+        )
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        pos0 = s0.particle_q.numpy()
+        initial_width = np.max(pos0[:, 0]) - np.min(pos0[:, 0])
+
+        dt = 1.0 / 60.0
+        for _ in range(120):
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+        final_width = np.max(pos[:, 0]) - np.min(pos[:, 0])
+
+        stretch = abs(final_width - initial_width) / initial_width
+        self.assertLess(stretch, 0.05, f"Stretch {stretch:.3%} exceeds 5% with bending")
+
+    def test_bending_stiffness_scales_with_thickness(self):
+        """Doubling thickness should roughly 8x the bending stiffness (h³ scaling).
+
+        So a 4mm sheet should sag about 8x less than a 2mm sheet.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        sags = {}
+        for h in [0.002, 0.004]:  # 2mm and 4mm
+            builder = newton.ModelBuilder(gravity=-9.81)
+            builder.add_cloth_grid(
+                pos=wp.vec3(0, 0, 1),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0, 0, 0),
+                dim_x=8,
+                dim_y=8,
+                cell_x=0.1,
+                cell_y=0.1,
+                mass=0.05,
+                fix_left=True,
+            )
+            builder.color(include_bending=True)
+            model = builder.finalize("cuda:0")
+
+            solver = SolverFEMShell(
+                model,
+                young_modulus=1.0e9,
+                poisson_ratio=0.3,
+                thickness=h,
+            )
+
+            s0, s1 = model.state(), model.state()
+            ctrl = model.control()
+            contacts = model.contacts()
+
+            pos0 = s0.particle_q.numpy()
+            z0 = np.min(pos0[:, 2])
+
+            dt = 1.0 / 60.0
+            for _ in range(120):
+                s0.clear_forces()
+                model.collide(s0, contacts)
+                solver.step(s0, s1, ctrl, contacts, dt)
+                s0, s1 = s1, s0
+
+            wp.synchronize()
+            pos = s0.particle_q.numpy()
+            sags[h] = z0 - np.min(pos[:, 2])
+
+        ratio = sags[0.002] / max(sags[0.004], 1e-10)
+        # h³ scaling: (4/2)³ = 8, so thin sheet sags ~8x more
+        # Allow range [3, 20] for numerical tolerance
+        self.assertGreater(ratio, 3.0, f"Thickness scaling ratio {ratio:.1f} too low (expect ~8)")
+        self.assertLess(ratio, 20.0, f"Thickness scaling ratio {ratio:.1f} too high")
+
+
 if __name__ == "__main__":
     wp.init()
     unittest.main()
