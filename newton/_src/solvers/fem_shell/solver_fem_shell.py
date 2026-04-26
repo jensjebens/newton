@@ -448,9 +448,9 @@ def _compute_simple_contacts(
     # Ground
     depth = ground_z + margin - p[2]
     if depth > 0.0:
-        f_z = contact_stiffness * depth - contact_damping * v[2]
-        if f_z > 0.0:
-            wp.atomic_add(forces, i, wp.vec3(0.0, 0.0, f_z))
+        # Quadratic penalty + strong damping
+        f_z = contact_stiffness * depth * depth + contact_damping * wp.max(-v[2], 0.0)
+        wp.atomic_add(forces, i, wp.vec3(0.0, 0.0, f_z))
     # Sphere
     to_s = p - sphere_center
     dist = wp.length(to_s)
@@ -458,9 +458,8 @@ def _compute_simple_contacts(
     if pen > 0.0 and dist > 1.0e-8:
         n = to_s / dist
         vn = wp.dot(v, n)
-        fc = contact_stiffness * pen - contact_damping * vn
-        if fc > 0.0:
-            wp.atomic_add(forces, i, n * fc)
+        fc = contact_stiffness * pen * pen + contact_damping * wp.max(-vn, 0.0)
+        wp.atomic_add(forces, i, n * fc)
 
 
 @wp.kernel
@@ -514,10 +513,16 @@ def _update_velocity(
     damping: float,
     particle_qd_out: wp.array(dtype=wp.vec3),
 ):
-    """v_{n+1} = (1 - damping) * (v_n + dv), fixed particles stay at zero."""
+    """v_{n+1} = (1 - damping) * (v_n + dv), clamped to max velocity."""
     i = wp.tid()
     if particle_inv_mass[i] > 0.0:
-        particle_qd_out[i] = (1.0 - damping) * (particle_qd_in[i] + dv[i])
+        new_v = (1.0 - damping) * (particle_qd_in[i] + dv[i])
+        # Clamp velocity to prevent explosion
+        speed = wp.length(new_v)
+        max_speed = 20.0  # m/s
+        if speed > max_speed:
+            new_v = new_v * (max_speed / speed)
+        particle_qd_out[i] = new_v
     else:
         particle_qd_out[i] = wp.vec3(0.0)
 
