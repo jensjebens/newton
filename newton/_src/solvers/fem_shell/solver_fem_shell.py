@@ -475,6 +475,41 @@ def _compute_simple_contacts(
 
 
 @wp.kernel
+def _project_contacts(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_inv_mass: wp.array(dtype=float),
+    ground_z: float,
+    sphere_center: wp.vec3,
+    sphere_radius: float,
+):
+    """Project particles out of collision volumes (position correction)."""
+    i = wp.tid()
+    if particle_inv_mass[i] <= 0.0:
+        return
+    p = particle_q[i]
+
+    # Ground projection
+    if p[2] < ground_z:
+        particle_q[i] = wp.vec3(p[0], p[1], ground_z)
+        v = particle_qd[i]
+        if v[2] < 0.0:
+            particle_qd[i] = wp.vec3(v[0], v[1], 0.0)
+
+    # Sphere projection
+    p = particle_q[i]  # re-read after ground fix
+    to_s = p - sphere_center
+    dist = wp.length(to_s)
+    if dist < sphere_radius and dist > 1.0e-8:
+        n = to_s / dist
+        particle_q[i] = sphere_center + n * sphere_radius
+        v = particle_qd[i]
+        vn = wp.dot(v, n)
+        if vn < 0.0:
+            particle_qd[i] = v - n * vn  # remove inward velocity
+
+
+@wp.kernel
 def _update_plastic_rest_angles(
     particle_q: wp.array(dtype=wp.vec3),
     edge_indices: wp.array2d(dtype=wp.int32),
@@ -874,6 +909,22 @@ class SolverFEMShell(SolverBase):
                 device=device,
             )
             wp.copy(state_out.particle_q, self._q_temp)
+
+            # Position projection: push particles out of colliders
+            if hasattr(self, '_contact_sphere_center'):
+                wp.launch(
+                    _project_contacts,
+                    dim=n,
+                    inputs=[
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_inv_mass,
+                        0.0,  # ground_z
+                        self._contact_sphere_center,
+                        self._contact_sphere_radius,
+                    ],
+                    device=device,
+                )
 
             # Plastic deformation: update rest angles if yield exceeded
             if self.yield_angle > 0.0 and model.edge_count > 0:
