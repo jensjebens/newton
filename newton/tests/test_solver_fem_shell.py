@@ -508,6 +508,270 @@ class TestBendingEnergy(unittest.TestCase):
         self.assertLess(ratio, 10.0, f"Thickness scaling ratio {ratio:.1f} too high")
 
 
+# ---------------------------------------------------------------------------
+# Phase C Tests: IPC Contact
+# ---------------------------------------------------------------------------
+class TestIPCGroundContact(unittest.TestCase):
+    """Phase C: IPC barrier contact must prevent ground penetration."""
+
+    def test_ipc_ground_zero_penetration(self):
+        """Sheet drops onto ground plane via IPC barrier — ALL particles z >= 0.
+
+        Uses ipctk barrier potential instead of custom penalty.
+        The solver must accept `use_ipc=True` to enable IPC contact mode.
+        Ground plane at z=0, sheet starts at z=0.5.
+        After 2s settling, every particle must be above ground.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=10,
+            dim_y=10,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=1.0e8,
+            poisson_ratio=0.3,
+            thickness=0.001,
+            use_ipc=True,
+        )
+        solver.set_ipc_ground(z=0.0)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(120):  # 2 seconds
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+
+        # Zero penetration: all z >= -epsilon
+        min_z = np.min(pos[:, 2])
+        self.assertGreaterEqual(
+            min_z, -1e-4,
+            f"IPC ground penetration: min z = {min_z:.6f} (should be >= 0)"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
+class TestIPCSelfCollision(unittest.TestCase):
+    """Phase C: IPC must prevent self-intersection when sheet folds."""
+
+    def test_folding_sheet_no_self_intersection(self):
+        """Sheet pinned at both ends with gravity should fold but not self-intersect.
+
+        Pin left and right edges. Apply strong gravity so the middle sags
+        and potentially folds. IPC self-collision must keep minimum distance > 0
+        between non-adjacent faces.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+        import ipctk
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=16,
+            dim_y=4,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            fix_left=True,
+            fix_right=True,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=1.0e6,  # soft, so it sags a lot
+            poisson_ratio=0.3,
+            thickness=0.001,
+            use_ipc=True,
+        )
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(180):  # 3 seconds
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+
+        # Check no self-intersection using ipctk
+        tri_np = model.tri_indices.numpy()  # (T, 3)
+        collision_mesh = ipctk.CollisionMesh(pos, tri_np)
+        self.assertFalse(
+            ipctk.has_intersections(collision_mesh, pos),
+            "Self-intersection detected in folded sheet"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
+class TestIPCCCDStepSize(unittest.TestCase):
+    """Phase C: CCD step size limiting must prevent tunneling."""
+
+    def test_fast_impact_no_tunneling(self):
+        """Sheet with high initial velocity hits ground — must not tunnel through.
+
+        Initial velocity -20 m/s downward, ground at z=0, sheet starts at z=0.3.
+        Without CCD limiting, the sheet would pass through the ground in one
+        substep. CCD must clamp the step size.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 0.3),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, -20.0),  # fast downward
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=1.0e8,
+            poisson_ratio=0.3,
+            thickness=0.001,
+            use_ipc=True,
+        )
+        solver.set_ipc_ground(z=0.0)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(60):  # 1 second
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+
+        min_z = np.min(pos[:, 2])
+        self.assertGreaterEqual(
+            min_z, -1e-4,
+            f"Tunneling detected: min z = {min_z:.6f}"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
+class TestIPCFriction(unittest.TestCase):
+    """Phase C: Basic friction should prevent sliding on shallow slopes."""
+
+    def test_sheet_on_shallow_slope_static(self):
+        """Sheet resting on 20° slope with μ=0.5 should not slide (tan(20°)≈0.36 < 0.5).
+
+        Place a settled sheet on a tilted ground plane. With sufficient friction,
+        the sheet should remain stationary. Measure center-of-mass displacement
+        along the slope direction — should be < 5cm over 2 seconds.
+        """
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        # Build sheet at slight height so it settles onto the slope
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model,
+            young_modulus=1.0e8,
+            poisson_ratio=0.3,
+            thickness=0.001,
+            use_ipc=True,
+        )
+        # 20° slope: normal = (-sin20, 0, cos20), point on plane = origin
+        import math
+        angle_deg = 20.0
+        angle_rad = math.radians(angle_deg)
+        solver.set_ipc_ground(
+            z=0.0,
+            normal=(- math.sin(angle_rad), 0.0, math.cos(angle_rad)),
+            friction_coefficient=0.5,
+        )
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        pos0 = s0.particle_q.numpy()
+        com0_x = np.mean(pos0[:, 0])
+
+        dt = 1.0 / 60.0
+        for _ in range(120):  # 2 seconds
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+        com_x = np.mean(pos[:, 0])
+
+        # Slope tilts in -x direction (gravity component along slope)
+        # Sheet should NOT slide more than 5cm
+        slide = abs(com_x - com0_x)
+        self.assertLess(
+            slide, 0.05,
+            f"Sheet slid {slide:.3f}m on 20° slope with μ=0.5 — friction not working"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
 if __name__ == "__main__":
     wp.init()
     unittest.main()

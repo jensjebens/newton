@@ -12,9 +12,16 @@ The analytic Hessian is adapted from Newton's VBD StVK implementation
 """
 
 import numpy as np
+import scipy.sparse
 import warp as wp
 import warp.sparse as wps
 from warp.optim.linear import cg, preconditioner
+
+try:
+    import ipctk
+    _HAS_IPCTK = True
+except ImportError:
+    _HAS_IPCTK = False
 
 from newton._src.solvers.solver import SolverBase
 
@@ -706,6 +713,8 @@ class SolverFEMShell(SolverBase):
         substeps: int = 8,
         yield_angle: float = 0.0,
         plasticity_rate: float = 0.5,
+        use_ipc: bool = False,
+        ipc_dhat: float = 0.01,
     ):
         super().__init__(model)
 
@@ -719,6 +728,20 @@ class SolverFEMShell(SolverBase):
         self.yield_angle = yield_angle
         self.plasticity_rate = plasticity_rate
         self.last_residual = float("inf")
+
+        # IPC contact
+        self.use_ipc = use_ipc
+        self.ipc_dhat = ipc_dhat
+        self._ipc_ground_z = None
+        self._ipc_ground_normal = None
+        self._ipc_ground_origin = None
+        self._ipc_friction_mu = 0.0
+        self._ipc_kappa = None  # barrier stiffness, auto-estimated on first step
+        self._ipc_collision_mesh = None
+        self._ipc_prev_min_dist = None
+
+        if use_ipc and not _HAS_IPCTK:
+            raise ImportError("use_ipc=True requires ipctk: pip install ipctk")
 
         # Lamé parameters from E, ν — plane STRESS for thin shells
         # (not plane strain which has 1-2ν denominator and diverges as ν→0.5)
@@ -827,9 +850,46 @@ class SolverFEMShell(SolverBase):
                     device=device,
                 )
 
-            # 1c. Simple contact forces (ground + sphere)
-            # TODO Phase C: replace with proper IPC barriers
-            if hasattr(self, '_contact_sphere_center'):
+            # 1c. Contact forces
+            ipc_grad = None
+            ipc_hess_diag = None
+            ipc_self_grad = None
+            ipc_self_hess = None
+
+            if self.use_ipc:
+                # Transfer positions GPU → CPU for ipctk
+                wp.synchronize()
+                V_np = state_out.particle_q.numpy().astype(np.float64)
+
+                # Ground plane IPC barrier
+                ipc_grad, ipc_hess_diag = self._compute_ipc_contact(V_np)
+
+                # Self-collision IPC barrier
+                ipc_self_grad, ipc_self_hess = self._compute_ipc_self_collision(V_np)
+
+                # Add IPC ground forces to elastic forces on GPU
+                ipc_forces_wp = wp.array(ipc_grad.astype(np.float32), dtype=wp.vec3, device=device)
+                wp.launch(
+                    _add_external_forces,
+                    dim=n,
+                    inputs=[ipc_forces_wp, self._elastic_forces],
+                    outputs=[self._elastic_forces],
+                    device=device,
+                )
+
+                # Add self-collision forces
+                if ipc_self_grad is not None:
+                    self_forces = ipc_self_grad.reshape(-1, 3).astype(np.float32)
+                    self_forces_wp = wp.array(self_forces, dtype=wp.vec3, device=device)
+                    wp.launch(
+                        _add_external_forces,
+                        dim=n,
+                        inputs=[self_forces_wp, self._elastic_forces],
+                        outputs=[self._elastic_forces],
+                        device=device,
+                    )
+
+            elif hasattr(self, '_contact_sphere_center'):
                 wp.launch(
                     _compute_simple_contacts,
                     dim=n,
@@ -851,7 +911,56 @@ class SolverFEMShell(SolverBase):
             # Pre-allocate combined triplet arrays (avoid numpy concat in hot loop)
             n_mem = model.tri_count * 9
             n_bend = model.edge_count * 16
-            n_total = n_mem + n_bend
+
+            # Count IPC contact triplets
+            n_ipc_ground = 0
+            n_ipc_self = 0
+            ipc_ground_rows = None
+            ipc_ground_cols = None
+            ipc_ground_vals = None
+            ipc_self_rows = None
+            ipc_self_cols = None
+            ipc_self_vals = None
+
+            if self.use_ipc and ipc_hess_diag is not None:
+                # Ground plane: diagonal blocks only (n blocks)
+                nz_mask = np.any(np.abs(ipc_hess_diag) > 1e-20, axis=(1, 2))
+                nz_indices = np.where(nz_mask)[0]
+                n_ipc_ground = len(nz_indices)
+                if n_ipc_ground > 0:
+                    ipc_ground_rows = wp.array(nz_indices.astype(np.int32), dtype=wp.int32, device=device)
+                    ipc_ground_cols = wp.array(nz_indices.astype(np.int32), dtype=wp.int32, device=device)
+                    # Scale by dt^2 to match the stiffness matrix scaling
+                    scaled_vals = (ipc_hess_diag[nz_indices] * sub_dt * sub_dt).astype(np.float32)
+                    ipc_ground_vals = wp.array(
+                        scaled_vals.reshape(-1, 3, 3),
+                        dtype=wp.mat33, device=device
+                    )
+
+            if self.use_ipc and ipc_self_hess is not None:
+                # Self-collision: scipy CSR sparse → triplets
+                coo = ipc_self_hess.tocoo()
+                # Convert from (n*3, n*3) scalar sparse to (n, n) block sparse
+                block_rows = (coo.row // 3).astype(np.int32)
+                block_cols = (coo.col // 3).astype(np.int32)
+                local_r = coo.row % 3
+                local_c = coo.col % 3
+                # Group into 3x3 blocks
+                block_key = block_rows * n + block_cols
+                unique_keys, inverse = np.unique(block_key, return_inverse=True)
+                n_ipc_self = len(unique_keys)
+                if n_ipc_self > 0:
+                    self_block_rows = (unique_keys // n).astype(np.int32)
+                    self_block_cols = (unique_keys % n).astype(np.int32)
+                    self_block_vals = np.zeros((n_ipc_self, 3, 3), dtype=np.float32)
+                    for idx in range(len(coo.data)):
+                        bi = inverse[idx]
+                        self_block_vals[bi, local_r[idx], local_c[idx]] += float(coo.data[idx]) * sub_dt * sub_dt
+                    ipc_self_rows = wp.array(self_block_rows, dtype=wp.int32, device=device)
+                    ipc_self_cols = wp.array(self_block_cols, dtype=wp.int32, device=device)
+                    ipc_self_vals = wp.array(self_block_vals, dtype=wp.mat33, device=device)
+
+            n_total = n_mem + n_bend + n_ipc_ground + n_ipc_self
 
             if not hasattr(self, '_all_rows') or self._all_rows.shape[0] != n_total:
                 self._all_rows = wp.zeros(n_total, dtype=wp.int32, device=device)
@@ -866,6 +975,18 @@ class SolverFEMShell(SolverBase):
             wp.copy(self._all_rows, self._bend_triplet_rows, dest_offset=n_mem, src_offset=0, count=n_bend)
             wp.copy(self._all_cols, self._bend_triplet_cols, dest_offset=n_mem, src_offset=0, count=n_bend)
             wp.copy(self._all_vals, self._bend_triplet_vals, dest_offset=n_mem, src_offset=0, count=n_bend)
+            # Copy IPC ground triplets
+            offset = n_mem + n_bend
+            if n_ipc_ground > 0:
+                wp.copy(self._all_rows, ipc_ground_rows, dest_offset=offset, src_offset=0, count=n_ipc_ground)
+                wp.copy(self._all_cols, ipc_ground_cols, dest_offset=offset, src_offset=0, count=n_ipc_ground)
+                wp.copy(self._all_vals, ipc_ground_vals, dest_offset=offset, src_offset=0, count=n_ipc_ground)
+                offset += n_ipc_ground
+            # Copy IPC self-collision triplets
+            if n_ipc_self > 0:
+                wp.copy(self._all_rows, ipc_self_rows, dest_offset=offset, src_offset=0, count=n_ipc_self)
+                wp.copy(self._all_cols, ipc_self_cols, dest_offset=offset, src_offset=0, count=n_ipc_self)
+                wp.copy(self._all_vals, ipc_self_vals, dest_offset=offset, src_offset=0, count=n_ipc_self)
 
             K = wps.bsr_from_triplets(
                 rows_of_blocks=n, cols_of_blocks=n,
@@ -922,6 +1043,29 @@ class SolverFEMShell(SolverBase):
             )
 
             # 6. Update position: x_{n+1} = x_n + dt * v_{n+1}
+            # With IPC: limit step via CCD to prevent tunneling
+            if self.use_ipc:
+                wp.synchronize()
+                V_current = state_out.particle_q.numpy().astype(np.float64)
+                V_vel = state_out.particle_qd.numpy().astype(np.float64)
+                inv_mass = model.particle_inv_mass.numpy()
+                # Build candidate positions
+                V_candidate = V_current.copy()
+                for i in range(n):
+                    if inv_mass[i] > 0:
+                        V_candidate[i] += sub_dt * V_vel[i]
+                # CCD step size
+                alpha = self._ipc_ccd_step_size(V_current, V_candidate)
+                # Apply clamped step
+                effective_dt = sub_dt * min(alpha, 1.0)
+                # Scale velocity for this substep to match clamped step
+                if alpha < 1.0:
+                    scale = float(alpha)
+                    vel_scaled = V_vel * scale
+                    state_out.particle_qd = wp.array(
+                        vel_scaled.astype(np.float32), dtype=wp.vec3, device=device
+                    )
+
             wp.launch(
                 _update_position,
                 dim=n,
@@ -933,7 +1077,8 @@ class SolverFEMShell(SolverBase):
             wp.copy(state_out.particle_q, self._q_temp)
 
             # Position projection: push particles out of colliders
-            if hasattr(self, '_contact_sphere_center'):
+            # (only for legacy penalty contact; IPC handles this via barrier + CCD)
+            if not self.use_ipc and hasattr(self, '_contact_sphere_center'):
                 wp.launch(
                     _project_contacts,
                     dim=n,
@@ -963,6 +1108,38 @@ class SolverFEMShell(SolverBase):
                     device=device,
                 )
 
+            # IPC friction: apply Coulomb friction to tangential velocity
+            if self.use_ipc and self._ipc_friction_mu > 0 and self._ipc_ground_z is not None:
+                wp.synchronize()
+                pos_np = state_out.particle_q.numpy().astype(np.float64)
+                vel_np = state_out.particle_qd.numpy().astype(np.float64)
+                inv_mass_np = model.particle_inv_mass.numpy()
+                n_vec = self._ipc_ground_normal
+                mu = self._ipc_friction_mu
+                dhat = self.ipc_dhat
+
+                for i in range(n):
+                    if inv_mass_np[i] <= 0:
+                        continue
+                    # Distance to ground plane
+                    d = np.dot(pos_np[i] - self._ipc_ground_origin, n_vec)
+                    if d < dhat:  # within contact zone
+                        v = vel_np[i]
+                        v_n = np.dot(v, n_vec) * n_vec  # normal component
+                        v_t = v - v_n  # tangential component
+                        v_t_mag = np.linalg.norm(v_t)
+                        if v_t_mag > 1e-10:
+                            # Normal force magnitude (from barrier gradient)
+                            f_n = abs(np.dot(pos_np[i] - self._ipc_ground_origin, n_vec))
+                            # Coulomb: clamp tangential impulse
+                            max_friction = mu * (1.0 / inv_mass_np[i]) * 9.81 * sub_dt
+                            friction_impulse = min(v_t_mag, max_friction)
+                            vel_np[i] -= (friction_impulse / v_t_mag) * v_t
+
+                state_out.particle_qd = wp.array(
+                    vel_np.astype(np.float32), dtype=wp.vec3, device=device
+                )
+
         self.integrate_bodies(model, state_in, state_out, dt)
 
     def set_contact_sphere(self, center, radius, stiffness=1e4, damping=10.0):
@@ -978,3 +1155,143 @@ class SolverFEMShell(SolverBase):
         self._contact_sphere_radius = float(radius)
         self._contact_stiffness = float(stiffness)
         self._contact_damping = float(damping)
+
+    def set_ipc_ground(self, z=0.0, normal=None, friction_coefficient=0.0):
+        """Configure IPC barrier-based ground plane contact.
+
+        Args:
+            z: Ground plane height (default 0).
+            normal: Ground plane normal as (x, y, z) tuple. Default (0, 0, 1).
+            friction_coefficient: Coulomb friction coefficient (0 = frictionless).
+        """
+        if not self.use_ipc:
+            raise RuntimeError("set_ipc_ground requires use_ipc=True")
+        if normal is None:
+            normal = (0.0, 0.0, 1.0)
+        self._ipc_ground_z = float(z)
+        n = np.array(normal, dtype=np.float64)
+        n = n / np.linalg.norm(n)
+        self._ipc_ground_normal = n
+        # Compute a point on the plane: z * normal (for tilted planes)
+        self._ipc_ground_origin = n * z
+        self._ipc_friction_mu = float(friction_coefficient)
+
+    def _build_ipc_collision_mesh(self):
+        """Build ipctk CollisionMesh from model triangle indices (cached)."""
+        if self._ipc_collision_mesh is not None:
+            return self._ipc_collision_mesh
+        tri_np = self.model.tri_indices.numpy()  # (T, 3) int32
+        n_verts = self.model.particle_count
+        # Need a dummy V for construction (actual V provided at query time)
+        V_dummy = np.zeros((n_verts, 3), dtype=np.float64, order='F')
+        E = ipctk.edges(tri_np)
+        self._ipc_collision_mesh = ipctk.CollisionMesh(V_dummy, E, tri_np)
+        self._ipc_tri_np = tri_np
+        return self._ipc_collision_mesh
+
+    def _compute_ipc_contact(self, V):
+        """Compute IPC barrier gradient and diagonal hessian blocks for ground plane.
+
+        Args:
+            V: Vertex positions as (n, 3) float64 numpy array.
+
+        Returns:
+            (gradient, hess_diag): gradient is (n, 3) forces, hess_diag is (n, 3, 3) blocks.
+        """
+        n = V.shape[0]
+        grad = np.zeros((n, 3), dtype=np.float64)
+        hess_diag = np.zeros((n, 3, 3), dtype=np.float64)
+
+        if self._ipc_ground_z is not None:
+            V_f = np.asfortranarray(V)
+            dhat = self.ipc_dhat
+            bp = ipctk.BarrierPotential(dhat=dhat)
+
+            # Construct plane collisions
+            origin = np.asfortranarray(self._ipc_ground_origin.reshape(1, 3))
+            normal = np.asfortranarray(self._ipc_ground_normal.reshape(1, 3))
+            plane_collisions = ipctk.construct_point_plane_collisions(
+                V_f, origin, normal, dhat=dhat
+            )
+
+            # Auto-estimate barrier stiffness on first call
+            if self._ipc_kappa is None and len(plane_collisions) > 0:
+                bbox_diag = ipctk.world_bbox_diagonal_length(V_f)
+                # Use a reasonable default: scale by average mass
+                avg_mass = 1.0 / max(np.mean(self.model.particle_inv_mass.numpy()), 1e-10)
+                self._ipc_kappa = avg_mass * 1e4  # heuristic, will be adaptive
+
+            kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
+
+            for pc in plane_collisions:
+                vid = pc.vertex_id
+                x = np.asfortranarray(V[vid].reshape(3, 1))
+                g = bp.gradient(pc, x).flatten()
+                h = bp.hessian(pc, x,
+                               project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+                grad[vid] += kappa * g
+                hess_diag[vid] += kappa * h
+
+        return grad, hess_diag
+
+    def _compute_ipc_self_collision(self, V):
+        """Compute IPC self-collision barrier gradient and sparse hessian.
+
+        Args:
+            V: Vertex positions (n, 3) float64.
+
+        Returns:
+            (gradient, hessian_csr): gradient (n*3,), hessian as scipy CSR or None.
+        """
+        cm = self._build_ipc_collision_mesh()
+        V_f = np.asfortranarray(V)
+        dhat = self.ipc_dhat
+
+        nc = ipctk.NormalCollisions()
+        nc.build(cm, V_f, dhat=dhat)
+
+        if len(nc) == 0:
+            return np.zeros(V.shape[0] * 3, dtype=np.float64), None
+
+        bp = ipctk.BarrierPotential(dhat=dhat)
+        kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
+
+        grad = kappa * bp.gradient(nc, cm, V_f)
+        hess = kappa * bp.hessian(nc, cm, V_f,
+                                   project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+        return grad, hess
+
+    def _ipc_ccd_step_size(self, V_current, V_candidate):
+        """Compute maximum collision-free step size via CCD.
+
+        Args:
+            V_current: Current positions (n, 3) float64.
+            V_candidate: Candidate positions (n, 3) float64.
+
+        Returns:
+            float: Maximum safe step fraction in [0, 1].
+        """
+        alpha = 1.0
+
+        # Ground plane CCD
+        if self._ipc_ground_z is not None:
+            origin = np.asfortranarray(self._ipc_ground_origin.reshape(1, 3))
+            normal = np.asfortranarray(self._ipc_ground_normal.reshape(1, 3))
+            alpha_ground = ipctk.compute_point_plane_collision_free_stepsize(
+                np.asfortranarray(V_current),
+                np.asfortranarray(V_candidate),
+                origin, normal
+            )
+            alpha = min(alpha, alpha_ground)
+
+        # Self-collision CCD
+        cm = self._build_ipc_collision_mesh()
+        alpha_self = ipctk.compute_collision_free_stepsize(
+            cm,
+            np.asfortranarray(V_current),
+            np.asfortranarray(V_candidate),
+        )
+        alpha = min(alpha, alpha_self)
+
+        # Safety margin: use 0.8 * alpha to stay within barrier activation zone
+        return 0.8 * alpha
