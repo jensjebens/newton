@@ -740,6 +740,14 @@ class SolverFEMShell(SolverBase):
         self._ipc_collision_mesh = None
         self._ipc_prev_min_dist = None
 
+        # IPC sphere (unified mesh approach)
+        self._ipc_sphere_center = None
+        self._ipc_sphere_radius = None
+        self._ipc_sphere_friction = 0.0
+        self._ipc_sphere_verts = None  # (n_sphere, 3)
+        self._ipc_sphere_faces = None  # (t_sphere, 3)
+        self._ipc_unified_collision_mesh = None  # rebuilt when sphere moves
+
         if use_ipc and not _HAS_IPCTK:
             raise ImportError("use_ipc=True requires ipctk: pip install ipctk")
 
@@ -1176,18 +1184,137 @@ class SolverFEMShell(SolverBase):
         self._ipc_ground_origin = n * z
         self._ipc_friction_mu = float(friction_coefficient)
 
+    def set_ipc_sphere(self, center, radius, friction_coefficient=0.0, subdivisions=3):
+        """Configure IPC barrier-based sphere contact via unified CollisionMesh.
+
+        The sphere is tessellated as an icosphere and combined with the shell
+        mesh into a unified CollisionMesh. ipctk treats shell-vs-sphere as
+        self-collision within the unified mesh. Sphere vertices are kinematic
+        (not affected by contact forces).
+
+        Can be called each step to update sphere position (animated spheres).
+
+        Args:
+            center: Sphere center as (x, y, z) tuple.
+            radius: Sphere radius.
+            friction_coefficient: Coulomb friction coefficient (0 = frictionless).
+            subdivisions: Icosphere subdivision level (3 = ~162 verts, 4 = ~642 verts).
+        """
+        if not self.use_ipc:
+            raise RuntimeError("set_ipc_sphere requires use_ipc=True")
+
+        center = np.array(center, dtype=np.float64)
+        radius = float(radius)
+
+        # Only re-tessellate if radius changed or first call
+        if (self._ipc_sphere_verts is None or
+                self._ipc_sphere_radius != radius):
+            verts, faces = self._tessellate_icosphere(subdivisions)
+            self._ipc_sphere_verts = verts * radius  # unit sphere → scaled
+            self._ipc_sphere_faces = faces
+
+        self._ipc_sphere_center = center
+        self._ipc_sphere_radius = radius
+        self._ipc_sphere_friction = float(friction_coefficient)
+        # Invalidate unified collision mesh (sphere position changed)
+        self._ipc_unified_collision_mesh = None
+
+    @staticmethod
+    def _tessellate_icosphere(subdivisions=3):
+        """Generate unit icosphere mesh via recursive subdivision.
+
+        Returns:
+            (vertices, faces): vertices as (n, 3) float64, faces as (t, 3) int32.
+        """
+        # Start from icosahedron
+        phi = (1.0 + np.sqrt(5.0)) / 2.0  # golden ratio
+        verts = np.array([
+            [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+            [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+            [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+        ], dtype=np.float64)
+        # Normalize to unit sphere
+        verts = verts / np.linalg.norm(verts, axis=1, keepdims=True)
+
+        faces = np.array([
+            [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+            [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+            [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+            [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+        ], dtype=np.int32)
+
+        # Subdivide
+        for _ in range(subdivisions):
+            edge_midpoint = {}  # (min_idx, max_idx) → new vertex index
+            new_faces = []
+            verts_list = list(verts)
+
+            for f in faces:
+                mids = []
+                for i in range(3):
+                    e = tuple(sorted((f[i], f[(i + 1) % 3])))
+                    if e not in edge_midpoint:
+                        mid = (verts_list[e[0]] + verts_list[e[1]]) / 2.0
+                        mid = mid / np.linalg.norm(mid)  # project to sphere
+                        edge_midpoint[e] = len(verts_list)
+                        verts_list.append(mid)
+                    mids.append(edge_midpoint[e])
+
+                v0, v1, v2 = f[0], f[1], f[2]
+                m01, m12, m20 = mids[0], mids[1], mids[2]
+                new_faces.extend([
+                    [v0, m01, m20],
+                    [v1, m12, m01],
+                    [v2, m20, m12],
+                    [m01, m12, m20],
+                ])
+
+            verts = np.array(verts_list, dtype=np.float64)
+            faces = np.array(new_faces, dtype=np.int32)
+
+        return verts, faces
+
     def _build_ipc_collision_mesh(self):
-        """Build ipctk CollisionMesh from model triangle indices (cached)."""
-        if self._ipc_collision_mesh is not None:
-            return self._ipc_collision_mesh
-        tri_np = self.model.tri_indices.numpy()  # (T, 3) int32
-        n_verts = self.model.particle_count
-        # Need a dummy V for construction (actual V provided at query time)
-        V_dummy = np.zeros((n_verts, 3), dtype=np.float64, order='F')
-        E = ipctk.edges(tri_np)
-        self._ipc_collision_mesh = ipctk.CollisionMesh(V_dummy, E, tri_np)
-        self._ipc_tri_np = tri_np
-        return self._ipc_collision_mesh
+        """Build ipctk CollisionMesh from model triangle indices (cached).
+
+        If a sphere is configured, builds a unified mesh (shell + sphere)
+        for combined self-collision detection.
+        """
+        # Shell-only mesh (always needed)
+        if self._ipc_collision_mesh is None:
+            tri_np = self.model.tri_indices.numpy()  # (T, 3) int32
+            n_verts = self.model.particle_count
+            V_dummy = np.zeros((n_verts, 3), dtype=np.float64, order='F')
+            E = ipctk.edges(tri_np)
+            self._ipc_collision_mesh = ipctk.CollisionMesh(V_dummy, E, tri_np)
+            self._ipc_tri_np = tri_np
+            self._n_shell_verts = n_verts
+
+        # If no sphere, return shell-only mesh
+        if self._ipc_sphere_center is None:
+            return self._ipc_collision_mesh, self._n_shell_verts
+
+        # Build unified mesh (shell + sphere) — rebuilt when sphere moves
+        if self._ipc_unified_collision_mesh is None:
+            n_shell = self._n_shell_verts
+            shell_tri = self._ipc_tri_np
+
+            # Position sphere vertices at current center
+            sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
+            sphere_F = self._ipc_sphere_faces + n_shell  # offset indices
+
+            n_total = n_shell + len(sphere_V)
+            V_dummy = np.zeros((n_total, 3), dtype=np.float64, order='F')
+            V_dummy[:n_shell] = 0.0  # shell positions filled at query time
+            V_dummy[n_shell:] = sphere_V
+
+            F_unified = np.vstack([shell_tri, sphere_F]).astype(np.int32)
+            E_unified = ipctk.edges(F_unified)
+            self._ipc_unified_collision_mesh = ipctk.CollisionMesh(
+                V_dummy, E_unified, F_unified
+            )
+
+        return self._ipc_unified_collision_mesh, self._n_shell_verts
 
     def _compute_ipc_contact(self, V):
         """Compute IPC barrier gradient and diagonal hessian blocks for ground plane.
@@ -1237,36 +1364,60 @@ class SolverFEMShell(SolverBase):
     def _compute_ipc_self_collision(self, V):
         """Compute IPC self-collision barrier gradient and sparse hessian.
 
+        If a sphere is configured, uses the unified mesh (shell + sphere)
+        and slices out shell-only forces/hessian.
+
         Args:
-            V: Vertex positions (n, 3) float64.
+            V: Shell vertex positions (n_shell, 3) float64.
 
         Returns:
-            (gradient, hessian_csr): gradient (n*3,), hessian as scipy CSR or None.
+            (gradient, hessian_csr): gradient (n_shell*3,), hessian as scipy CSR or None.
         """
-        cm = self._build_ipc_collision_mesh()
-        V_f = np.asfortranarray(V)
+        cm, n_shell = self._build_ipc_collision_mesh()
         dhat = self.ipc_dhat
+
+        # Build unified vertex array if sphere is present
+        if self._ipc_sphere_center is not None:
+            sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
+            V_unified = np.vstack([V, sphere_V])
+        else:
+            V_unified = V
+
+        V_f = np.asfortranarray(V_unified)
 
         nc = ipctk.NormalCollisions()
         nc.build(cm, V_f, dhat=dhat)
 
         if len(nc) == 0:
-            return np.zeros(V.shape[0] * 3, dtype=np.float64), None
+            return np.zeros(n_shell * 3, dtype=np.float64), None
 
         bp = ipctk.BarrierPotential(dhat=dhat)
         kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
 
-        grad = kappa * bp.gradient(nc, cm, V_f)
-        hess = kappa * bp.hessian(nc, cm, V_f,
-                                   project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+        grad_full = kappa * bp.gradient(nc, cm, V_f)
+        hess_full = kappa * bp.hessian(nc, cm, V_f,
+                                        project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+
+        # Slice to shell-only vertices
+        n3 = n_shell * 3
+        grad = grad_full[:n3]
+
+        # Slice hessian to shell-only block (top-left n3 x n3)
+        if hess_full is not None:
+            hess = hess_full[:n3, :n3]
+        else:
+            hess = None
+
         return grad, hess
 
     def _ipc_ccd_step_size(self, V_current, V_candidate):
         """Compute maximum collision-free step size via CCD.
 
+        Uses unified mesh (shell + sphere) when sphere is configured.
+
         Args:
-            V_current: Current positions (n, 3) float64.
-            V_candidate: Candidate positions (n, 3) float64.
+            V_current: Current shell positions (n_shell, 3) float64.
+            V_candidate: Candidate shell positions (n_shell, 3) float64.
 
         Returns:
             float: Maximum safe step fraction in [0, 1].
@@ -1284,12 +1435,22 @@ class SolverFEMShell(SolverBase):
             )
             alpha = min(alpha, alpha_ground)
 
-        # Self-collision CCD
-        cm = self._build_ipc_collision_mesh()
+        # Self-collision CCD (with unified mesh if sphere present)
+        cm, n_shell = self._build_ipc_collision_mesh()
+
+        if self._ipc_sphere_center is not None:
+            # Unified mesh: shell vertices move, sphere vertices stay fixed
+            sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
+            V_cur_unified = np.vstack([V_current, sphere_V])
+            V_cand_unified = np.vstack([V_candidate, sphere_V])  # sphere doesn't move within substep
+        else:
+            V_cur_unified = V_current
+            V_cand_unified = V_candidate
+
         alpha_self = ipctk.compute_collision_free_stepsize(
             cm,
-            np.asfortranarray(V_current),
-            np.asfortranarray(V_candidate),
+            np.asfortranarray(V_cur_unified),
+            np.asfortranarray(V_cand_unified),
         )
         alpha = min(alpha, alpha_self)
 

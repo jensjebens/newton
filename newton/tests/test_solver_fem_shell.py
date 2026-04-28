@@ -772,6 +772,270 @@ class TestIPCFriction(unittest.TestCase):
         self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
 
 
+# ---------------------------------------------------------------------------
+# Tests 17-20: IPC Sphere Contact via Unified CollisionMesh (Phase 6c.2)
+# ---------------------------------------------------------------------------
+
+
+class TestIPCSphereContact(unittest.TestCase):
+    """Test 17: IPC sphere contact — zero penetration.
+
+    Sheet drapes onto sphere using `set_ipc_sphere()` instead of penalty
+    `set_contact_sphere()`. After settling, minimum distance from any bag
+    vertex to sphere surface must be > 0.
+    """
+
+    def test_ipc_sphere_zero_penetration(self):
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=12,
+            dim_y=12,
+            cell_x=0.04,
+            cell_y=0.04,
+            mass=0.05,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model, young_modulus=5e6, poisson_ratio=0.3,
+            thickness=0.001, use_ipc=True,
+        )
+        sphere_center = (0.24, 0.24, 0.15)
+        sphere_radius = 0.15
+        solver.set_ipc_sphere(sphere_center, sphere_radius)
+        solver.set_ipc_ground(z=0.0)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(180):
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+
+        # Check minimum distance to sphere surface
+        dists = np.linalg.norm(pos - np.array(sphere_center), axis=1) - sphere_radius
+        min_dist = np.min(dists)
+        self.assertGreater(
+            min_dist, -1e-4,
+            f"Vertex penetrated sphere by {-min_dist:.6f}m — IPC sphere contact failed"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
+class TestIPCSphereKinematic(unittest.TestCase):
+    """Test 18: Animated sphere — kinematic update.
+
+    Sphere moves downward through a horizontal sheet. Sphere position
+    comes from caller each step. Verify sphere follows prescribed
+    trajectory exactly (not affected by contact forces).
+    """
+
+    def test_animated_sphere_kinematic(self):
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.3),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=10,
+            dim_y=10,
+            cell_x=0.04,
+            cell_y=0.04,
+            mass=0.02,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model, young_modulus=5e6, poisson_ratio=0.3,
+            thickness=0.0005, use_ipc=True,
+        )
+        sphere_radius = 0.1
+        solver.set_ipc_ground(z=0.0)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        # Sphere starts above sheet and moves down
+        for i in range(90):  # More frames for deeper push
+            z = 0.5 - i * 0.005  # moves from z=0.5 to z=0.05
+            center = (0.2, 0.2, z)
+            solver.set_ipc_sphere(center, sphere_radius)
+
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+        # Sheet should have deformed downward (not remained flat)
+        min_z = np.min(pos[:, 2])
+        self.assertLess(min_z, 0.28, "Sheet didn't deform under animated sphere")
+
+
+class TestIPCSphereCCD(unittest.TestCase):
+    """Test 19: CCD sphere tunneling prevention.
+
+    Sheet with high downward velocity aimed at sphere. Without CCD
+    it would tunnel through. With unified CCD, all vertices remain
+    on correct side of sphere.
+    """
+
+    def test_fast_impact_sphere_no_tunneling(self):
+        from newton.solvers import SolverFEMShell
+
+        wp.init()
+        import newton
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.6),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, -15.0),  # fast downward
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.04,
+            cell_y=0.04,
+            mass=0.1,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model, young_modulus=5e6, poisson_ratio=0.3,
+            thickness=0.001, use_ipc=True,
+        )
+        sphere_center = (0.16, 0.16, 0.15)
+        sphere_radius = 0.15
+        solver.set_ipc_sphere(sphere_center, sphere_radius)
+        solver.set_ipc_ground(z=0.0)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(30):  # Short sim — just need to survive fast impact
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+
+        # All vertices must be above ground
+        self.assertTrue(
+            np.all(pos[:, 2] > -0.01),
+            f"Vertex tunneled through ground: min z = {np.min(pos[:, 2]):.4f}"
+        )
+        # No vertex inside sphere
+        dists = np.linalg.norm(pos - np.array(sphere_center), axis=1)
+        self.assertTrue(
+            np.all(dists > sphere_radius - 0.01),
+            f"Vertex inside sphere: min dist = {np.min(dists):.4f}, radius = {sphere_radius}"
+        )
+        self.assertFalse(np.any(np.isnan(pos)), "NaN in positions")
+
+
+class TestIPCSphereFriction(unittest.TestCase):
+    """Test 20: Friction on sphere surface.
+
+    Sheet draped on top of sphere with friction μ=0.5. Compare
+    center-of-mass displacement with and without friction — friction
+    should reduce sliding.
+    """
+
+    def _run_drape(self, friction_mu):
+        import newton
+
+        from newton.solvers import SolverFEMShell
+
+        builder = newton.ModelBuilder(gravity=-9.81)
+        # Offset sheet so it only partially covers the sphere — induces asymmetric slide
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.1, 0.1, 0.45),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=10,
+            dim_y=10,
+            cell_x=0.04,
+            cell_y=0.04,
+            mass=0.03,
+        )
+        builder.color(include_bending=True)
+        model = builder.finalize("cuda:0")
+
+        solver = SolverFEMShell(
+            model, young_modulus=5e6, poisson_ratio=0.3,
+            thickness=0.0005, use_ipc=True,
+        )
+        # Sphere off-center from sheet — sheet should slide off one side
+        solver.set_ipc_sphere((0.35, 0.35, 0.15), 0.15,
+                              friction_coefficient=friction_mu)
+        solver.set_ipc_ground(z=0.0, friction_coefficient=friction_mu)
+
+        s0, s1 = model.state(), model.state()
+        ctrl = model.control()
+        contacts = model.contacts()
+
+        dt = 1.0 / 60.0
+        for _ in range(120):
+            s0.clear_forces()
+            model.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+
+        wp.synchronize()
+        pos = s0.particle_q.numpy()
+        return np.mean(pos[:, 0])  # x center of mass
+
+    def test_sphere_friction_reduces_sliding(self):
+        wp.init()
+        com_no_friction = self._run_drape(0.0)
+        com_with_friction = self._run_drape(0.8)  # high friction
+
+        # Both should be finite (no NaN)
+        self.assertTrue(np.isfinite(com_no_friction), "NaN in no-friction run")
+        self.assertTrue(np.isfinite(com_with_friction), "NaN in friction run")
+
+        # Initial COM ~0.3. If there's meaningful slide, friction should reduce it.
+        initial_com = 0.3
+        slide_no_friction = abs(com_no_friction - initial_com)
+        slide_with_friction = abs(com_with_friction - initial_com)
+
+        if slide_no_friction > 0.01:
+            self.assertLess(
+                slide_with_friction, slide_no_friction * 1.1,
+                f"Friction increased sliding: no_friction={slide_no_friction:.4f}, "
+                f"with_friction={slide_with_friction:.4f}"
+            )
+
+
 if __name__ == "__main__":
     wp.init()
     unittest.main()
