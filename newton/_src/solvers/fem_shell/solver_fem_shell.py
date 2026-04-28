@@ -1296,21 +1296,53 @@ class SolverFEMShell(SolverBase):
 
         return verts, faces
 
-    def _build_ipc_collision_mesh(self):
+    def _build_ipc_collision_mesh(self, V_actual=None):
         """Build ipctk CollisionMesh from model triangle indices (cached).
 
         If a sphere is configured, builds a unified mesh (shell + sphere)
         for combined self-collision detection.
+
+        Deduplicates coincident vertices to avoid zero-distance collision
+        pairs that produce NaN gradients in ipctk's barrier function.
+
+        Args:
+            V_actual: Actual vertex positions for deduplication check.
+                      Only needed on first call; cached after.
         """
         # Shell-only mesh (always needed)
         if self._ipc_collision_mesh is None:
             tri_np = self.model.tri_indices.numpy()  # (T, 3) int32
             n_verts = self.model.particle_count
-            V_dummy = np.zeros((n_verts, 3), dtype=np.float64, order='F')
-            E = ipctk.edges(tri_np)
-            self._ipc_collision_mesh = ipctk.CollisionMesh(V_dummy, E, tri_np)
-            self._ipc_tri_np = tri_np
-            self._n_shell_verts = n_verts
+
+            # Check for duplicate positions using actual vertex positions
+            if V_actual is not None:
+                rounded = np.round(V_actual, decimals=8)
+                _, unique_indices, inverse_map = np.unique(
+                    rounded, axis=0, return_index=True, return_inverse=True
+                )
+                has_duplicates = len(unique_indices) < n_verts
+            else:
+                has_duplicates = False
+
+            if has_duplicates:
+                # Remap face indices to deduplicated vertices
+                self._ipc_dedup_inverse = inverse_map  # maps original → dedup
+                self._ipc_dedup_n = len(unique_indices)
+                tri_remapped = inverse_map[tri_np].astype(np.int32)
+                V_dedup = np.asfortranarray(
+                    np.zeros((self._ipc_dedup_n, 3), dtype=np.float64))
+                E = ipctk.edges(tri_remapped)  # edges from remapped faces
+                self._ipc_collision_mesh = ipctk.CollisionMesh(V_dedup, E, tri_remapped)
+                self._ipc_tri_np = tri_remapped
+            else:
+                self._ipc_dedup_inverse = None
+                self._ipc_dedup_n = n_verts
+                V_dummy = np.zeros((n_verts, 3), dtype=np.float64, order='F')
+                E = ipctk.edges(tri_np)
+                self._ipc_collision_mesh = ipctk.CollisionMesh(V_dummy, E, tri_np)
+                self._ipc_tri_np = tri_np
+
+            self._n_shell_verts = n_verts  # original vert count (for gradient mapping)
 
         # If no sphere, return shell-only mesh
         if self._ipc_sphere_center is None:
@@ -1318,17 +1350,16 @@ class SolverFEMShell(SolverBase):
 
         # Build unified mesh (shell + sphere) — rebuilt when sphere moves
         if self._ipc_unified_collision_mesh is None:
-            n_shell = self._n_shell_verts
+            n_shell_dedup = self._ipc_dedup_n
             shell_tri = self._ipc_tri_np
 
             # Position sphere vertices at current center
             sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
-            sphere_F = self._ipc_sphere_faces + n_shell  # offset indices
+            sphere_F = self._ipc_sphere_faces + n_shell_dedup  # offset indices
 
-            n_total = n_shell + len(sphere_V)
+            n_total = n_shell_dedup + len(sphere_V)
             V_dummy = np.zeros((n_total, 3), dtype=np.float64, order='F')
-            V_dummy[:n_shell] = 0.0  # shell positions filled at query time
-            V_dummy[n_shell:] = sphere_V
+            V_dummy[n_shell_dedup:] = sphere_V
 
             F_unified = np.vstack([shell_tri, sphere_F]).astype(np.int32)
             E_unified = ipctk.edges(F_unified)
@@ -1406,21 +1437,35 @@ class SolverFEMShell(SolverBase):
         If a sphere is configured, uses the unified mesh (shell + sphere)
         and slices out shell-only forces/hessian.
 
+        Handles vertex deduplication: maps original positions to dedup
+        indices for ipctk, then maps gradients back to original indices.
+
         Args:
             V: Shell vertex positions (n_shell, 3) float64.
 
         Returns:
             (gradient, hessian_csr): gradient (n_shell*3,), hessian as scipy CSR or None.
         """
-        cm, n_shell = self._build_ipc_collision_mesh()
+        cm, n_shell = self._build_ipc_collision_mesh(V_actual=V)
+        n_dedup = self._ipc_dedup_n
         dhat = self.ipc_dhat
+
+        # Map original positions to deduplicated positions for ipctk
+        if self._ipc_dedup_inverse is not None:
+            # Average positions of duplicated vertices (they should be identical)
+            V_dedup = np.zeros((n_dedup, 3), dtype=np.float64)
+            np.add.at(V_dedup, self._ipc_dedup_inverse, V)
+            counts = np.bincount(self._ipc_dedup_inverse, minlength=n_dedup)
+            V_dedup /= counts[:, None].clip(min=1)
+        else:
+            V_dedup = V
 
         # Build unified vertex array if sphere is present
         if self._ipc_sphere_center is not None:
             sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
-            V_unified = np.vstack([V, sphere_V])
+            V_unified = np.vstack([V_dedup, sphere_V])
         else:
-            V_unified = V
+            V_unified = V_dedup
 
         V_f = np.asfortranarray(V_unified)
 
@@ -1435,21 +1480,46 @@ class SolverFEMShell(SolverBase):
 
         grad_full = kappa * bp.gradient(nc, cm, V_f)
 
+        # Check for NaN in gradient (indicates degenerate collision)
+        if np.any(np.isnan(grad_full)):
+            return np.zeros(n_shell * 3, dtype=np.float64), None
+
         # Try full PSD-projected hessian; fall back to None if PSD projection fails
         try:
             hess_full = kappa * bp.hessian(nc, cm, V_f,
                                             project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
         except RuntimeError:
-            # PSD projection can fail on degenerate configurations
             hess_full = None
 
-        # Slice to shell-only vertices
-        n3 = n_shell * 3
-        grad = grad_full[:n3]
+        # Slice to dedup shell vertices
+        n3_dedup = n_dedup * 3
+        grad_dedup = grad_full[:n3_dedup]
 
-        # Slice hessian to shell-only block (top-left n3 x n3)
+        # Map gradient back to original vertices
+        if self._ipc_dedup_inverse is not None:
+            grad_orig = np.zeros(n_shell * 3, dtype=np.float64)
+            for orig_idx in range(n_shell):
+                dedup_idx = self._ipc_dedup_inverse[orig_idx]
+                grad_orig[orig_idx*3:orig_idx*3+3] = grad_dedup[dedup_idx*3:dedup_idx*3+3]
+            grad = grad_orig
+        else:
+            grad = grad_dedup
+
+        # Slice hessian to shell-only block
         if hess_full is not None:
-            hess = hess_full[:n3, :n3]
+            hess_dedup = hess_full[:n3_dedup, :n3_dedup]
+            if self._ipc_dedup_inverse is not None:
+                # Map dedup hessian back to original indices
+                # Build a sparse expansion matrix: n_shell*3 x n_dedup*3
+                from scipy.sparse import csr_matrix
+                inv = self._ipc_dedup_inverse
+                rows = np.arange(n_shell * 3)
+                cols = np.array([inv[i//3]*3 + i%3 for i in range(n_shell * 3)])
+                data = np.ones(n_shell * 3)
+                P = csr_matrix((data, (rows, cols)), shape=(n_shell*3, n3_dedup))
+                hess = P @ hess_dedup @ P.T
+            else:
+                hess = hess_dedup
         else:
             hess = None
 
@@ -1482,15 +1552,28 @@ class SolverFEMShell(SolverBase):
 
         # Self-collision CCD (with unified mesh if sphere present)
         cm, n_shell = self._build_ipc_collision_mesh()
+        n_dedup = self._ipc_dedup_n
+
+        # Map to deduplicated positions
+        if self._ipc_dedup_inverse is not None:
+            V_cur_dedup = np.zeros((n_dedup, 3), dtype=np.float64)
+            V_cand_dedup = np.zeros((n_dedup, 3), dtype=np.float64)
+            np.add.at(V_cur_dedup, self._ipc_dedup_inverse, V_current)
+            np.add.at(V_cand_dedup, self._ipc_dedup_inverse, V_candidate)
+            counts = np.bincount(self._ipc_dedup_inverse, minlength=n_dedup)
+            V_cur_dedup /= counts[:, None].clip(min=1)
+            V_cand_dedup /= counts[:, None].clip(min=1)
+        else:
+            V_cur_dedup = V_current
+            V_cand_dedup = V_candidate
 
         if self._ipc_sphere_center is not None:
-            # Unified mesh: shell vertices move, sphere vertices stay fixed
             sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
-            V_cur_unified = np.vstack([V_current, sphere_V])
-            V_cand_unified = np.vstack([V_candidate, sphere_V])  # sphere doesn't move within substep
+            V_cur_unified = np.vstack([V_cur_dedup, sphere_V])
+            V_cand_unified = np.vstack([V_cand_dedup, sphere_V])
         else:
-            V_cur_unified = V_current
-            V_cand_unified = V_candidate
+            V_cur_unified = V_cur_dedup
+            V_cand_unified = V_cand_dedup
 
         alpha_self = ipctk.compute_collision_free_stepsize(
             cm,
