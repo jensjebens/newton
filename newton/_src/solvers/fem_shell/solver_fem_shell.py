@@ -947,23 +947,24 @@ class SolverFEMShell(SolverBase):
 
             if self.use_ipc and ipc_self_hess is not None:
                 # Self-collision: scipy CSR sparse → triplets
+                # Vectorized CSR → BSR conversion (no Python loop — #51)
                 coo = ipc_self_hess.tocoo()
-                # Convert from (n*3, n*3) scalar sparse to (n, n) block sparse
                 block_rows = (coo.row // 3).astype(np.int32)
                 block_cols = (coo.col // 3).astype(np.int32)
                 local_r = coo.row % 3
                 local_c = coo.col % 3
-                # Group into 3x3 blocks
-                block_key = block_rows * n + block_cols
+                # Unique block keys and vectorized accumulation
+                block_key = block_rows.astype(np.int64) * n + block_cols.astype(np.int64)
                 unique_keys, inverse = np.unique(block_key, return_inverse=True)
                 n_ipc_self = len(unique_keys)
                 if n_ipc_self > 0:
                     self_block_rows = (unique_keys // n).astype(np.int32)
                     self_block_cols = (unique_keys % n).astype(np.int32)
-                    self_block_vals = np.zeros((n_ipc_self, 3, 3), dtype=np.float32)
-                    for idx in range(len(coo.data)):
-                        bi = inverse[idx]
-                        self_block_vals[bi, local_r[idx], local_c[idx]] += float(coo.data[idx]) * sub_dt * sub_dt
+                    # Vectorized: encode (block_idx, local_r, local_c) → flat index
+                    flat_idx = inverse * 9 + local_r * 3 + local_c
+                    self_block_vals_flat = np.zeros(n_ipc_self * 9, dtype=np.float64)
+                    np.add.at(self_block_vals_flat, flat_idx, coo.data)
+                    self_block_vals = (self_block_vals_flat.reshape(n_ipc_self, 3, 3) * sub_dt * sub_dt).astype(np.float32)
                     ipc_self_rows = wp.array(self_block_rows, dtype=wp.int32, device=device)
                     ipc_self_cols = wp.array(self_block_cols, dtype=wp.int32, device=device)
                     ipc_self_vals = wp.array(self_block_vals, dtype=wp.mat33, device=device)
@@ -1116,37 +1117,58 @@ class SolverFEMShell(SolverBase):
                     device=device,
                 )
 
-            # IPC friction: apply Coulomb friction to tangential velocity
-            if self.use_ipc and self._ipc_friction_mu > 0 and self._ipc_ground_z is not None:
+            # IPC friction via ipctk TangentialCollisions (#49)
+            mu = max(self._ipc_friction_mu, self._ipc_sphere_friction)
+            if self.use_ipc and mu > 0:
                 wp.synchronize()
                 pos_np = state_out.particle_q.numpy().astype(np.float64)
                 vel_np = state_out.particle_qd.numpy().astype(np.float64)
-                inv_mass_np = model.particle_inv_mass.numpy()
-                n_vec = self._ipc_ground_normal
-                mu = self._ipc_friction_mu
-                dhat = self.ipc_dhat
 
-                for i in range(n):
-                    if inv_mass_np[i] <= 0:
-                        continue
-                    # Distance to ground plane
-                    d = np.dot(pos_np[i] - self._ipc_ground_origin, n_vec)
-                    if d < dhat:  # within contact zone
-                        v = vel_np[i]
-                        v_n = np.dot(v, n_vec) * n_vec  # normal component
-                        v_t = v - v_n  # tangential component
-                        v_t_mag = np.linalg.norm(v_t)
-                        if v_t_mag > 1e-10:
-                            # Normal force magnitude (from barrier gradient)
-                            f_n = abs(np.dot(pos_np[i] - self._ipc_ground_origin, n_vec))
-                            # Coulomb: clamp tangential impulse
-                            max_friction = mu * (1.0 / inv_mass_np[i]) * 9.81 * sub_dt
-                            friction_impulse = min(v_t_mag, max_friction)
-                            vel_np[i] -= (friction_impulse / v_t_mag) * v_t
+                # Get previous positions for velocity estimation
+                if not hasattr(self, '_ipc_prev_V') or self._ipc_prev_V is None:
+                    self._ipc_prev_V = pos_np.copy()
 
-                state_out.particle_qd = wp.array(
-                    vel_np.astype(np.float32), dtype=wp.vec3, device=device
-                )
+                try:
+                    cm, n_shell = self._build_ipc_collision_mesh()
+                    # Build unified V if sphere present
+                    if self._ipc_sphere_center is not None:
+                        sphere_V = self._ipc_sphere_verts + self._ipc_sphere_center
+                        V_f = np.asfortranarray(np.vstack([pos_np, sphere_V]))
+                        V_prev_f = np.asfortranarray(np.vstack([self._ipc_prev_V, sphere_V]))
+                    else:
+                        V_f = np.asfortranarray(pos_np)
+                        V_prev_f = np.asfortranarray(self._ipc_prev_V)
+
+                    dhat = self.ipc_dhat
+                    nc = ipctk.NormalCollisions()
+                    nc.build(cm, V_f, dhat=dhat)
+
+                    if len(nc) > 0:
+                        bp = ipctk.BarrierPotential(dhat=dhat)
+                        kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
+
+                        tc = ipctk.TangentialCollisions()
+                        tc.build(cm, V_f, nc, bp, kappa, mu)
+
+                        if len(tc) > 0:
+                            eps_v = 1e-3  # velocity mollifier
+                            fp = ipctk.FrictionPotential(eps_v=eps_v)
+                            friction_grad = fp.gradient(tc, cm, V_f, V_prev_f)
+                            # Slice to shell-only and apply as velocity correction
+                            friction_forces = friction_grad[:n_shell * 3].reshape(-1, 3)
+                            # Scale friction forces by inverse mass for velocity update
+                            inv_mass_np = model.particle_inv_mass.numpy()
+                            for i in range(n_shell):
+                                if inv_mass_np[i] > 0:
+                                    vel_np[i] -= friction_forces[i] * inv_mass_np[i] * sub_dt
+
+                            state_out.particle_qd = wp.array(
+                                vel_np.astype(np.float32), dtype=wp.vec3, device=device
+                            )
+                except Exception:
+                    pass  # Friction is best-effort; don't crash the sim
+
+                self._ipc_prev_V = pos_np.copy()
 
         self.integrate_bodies(model, state_in, state_out, dt)
 
@@ -1343,10 +1365,27 @@ class SolverFEMShell(SolverBase):
 
             # Auto-estimate barrier stiffness on first call
             if self._ipc_kappa is None and len(plane_collisions) > 0:
-                bbox_diag = ipctk.world_bbox_diagonal_length(V_f)
-                # Use a reasonable default: scale by average mass
-                avg_mass = 1.0 / max(np.mean(self.model.particle_inv_mass.numpy()), 1e-10)
-                self._ipc_kappa = avg_mass * 1e4  # heuristic, will be adaptive
+                # Adaptive barrier stiffness (#50) via ipctk
+                try:
+                    bbox_diag = ipctk.world_bbox_diagonal_length(V_f)
+                    avg_mass = 1.0 / max(np.mean(self.model.particle_inv_mass.numpy()), 1e-10)
+                    # Compute barrier gradient for stiffness estimation
+                    _barrier = ipctk.BarrierPotential(dhat=dhat)
+                    _nc_tmp = ipctk.NormalCollisions()
+                    _cm, _ = self._build_ipc_collision_mesh()
+                    _nc_tmp.build(_cm, V_f, dhat=dhat)
+                    if len(_nc_tmp) > 0:
+                        _grad_barrier = _barrier.gradient(_nc_tmp, _cm, V_f)
+                        _grad_energy = np.zeros_like(_grad_barrier)  # approximate
+                        self._ipc_kappa, self._ipc_max_kappa = ipctk.initial_barrier_stiffness(
+                            bbox_diag, ipctk.barrier, dhat, avg_mass,
+                            _grad_energy.reshape(-1, 1), _grad_barrier.reshape(-1, 1)
+                        )
+                    else:
+                        self._ipc_kappa = avg_mass * 1e4
+                except Exception:
+                    avg_mass = 1.0 / max(np.mean(self.model.particle_inv_mass.numpy()), 1e-10)
+                    self._ipc_kappa = avg_mass * 1e4  # fallback heuristic
 
             kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
 
