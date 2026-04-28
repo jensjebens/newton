@@ -1395,8 +1395,14 @@ class SolverFEMShell(SolverBase):
         kappa = self._ipc_kappa if self._ipc_kappa is not None else 1e6
 
         grad_full = kappa * bp.gradient(nc, cm, V_f)
-        hess_full = kappa * bp.hessian(nc, cm, V_f,
-                                        project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+
+        # Try full PSD-projected hessian; fall back to None if PSD projection fails
+        try:
+            hess_full = kappa * bp.hessian(nc, cm, V_f,
+                                            project_hessian_to_psd=ipctk.PSDProjectionMethod.CLAMP)
+        except RuntimeError:
+            # PSD projection can fail on degenerate configurations
+            hess_full = None
 
         # Slice to shell-only vertices
         n3 = n_shell * 3
